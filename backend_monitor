@@ -1,113 +1,156 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
-import sys
-import ConfigParser
+import configparser
+import logging
+import os
+import socket
 import threading
 import time
-import daemon
-import logging
-import MySQLdb
-import os
-from BaseHTTPServer import BaseHTTPRequestHandler,HTTPServer
-from daemon import runner
-from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import pymysql
+
+
+POLL_INTERVAL = 1
+DB_TIMEOUT = 2
+HEALTH_MAX_AGE = 5
+REQUEST_DEADLINE = 2
+MAX_REQUESTS = 16
+
+
+class Health:
+    def __init__(self):
+        self._healthy_since = None
+        self._lock = threading.Lock()
+
+    def update(self, writable):
+        with self._lock:
+            self._healthy_since = time.monotonic() if writable else None
+
+    def is_healthy(self):
+        with self._lock:
+            return (
+                self._healthy_since is not None
+                and time.monotonic() - self._healthy_since < HEALTH_MAX_AGE
+            )
+
 
 class DBCheck(threading.Thread):
-  def __init__(self, mysqlconf):
-    self.mysql_host = mysqlconf["mysql_host"][0]
-    self.mysql_user = mysqlconf["mysql_user"][0]
-    self.mysql_password = mysqlconf["mysql_password"][0]
-    self.mysql_database = mysqlconf["mysql_database"][0]
-    super(DBCheck, self).__init__()
-    logging.warning("MySQLWorker created")
+    def __init__(self, mysql_config, health, stop):
+        super().__init__(name="mysql-poller", daemon=True)
+        self.mysql_config = mysql_config
+        self.health = health
+        self.stop = stop
 
-  def run(self):
-    while True:
-      db = MySQLdb.connect(host=self.mysql_host, user=self.mysql_user, passwd=self.mysql_password, db=self.mysql_database)
-      dbcursor = db.cursor()
-      dbcursor.execute("show variables like 'read_only'")
-      state = dbcursor.fetchone();
-      global CACHE
-      if state[1] == 'ON':
-        CACHE = "NOT OK"
-      else:
-        CACHE = "OK"
-      #logging.debug(CACHE)
-      db.close()
-      time.sleep(1)
+    def poll(self):
+        try:
+            with pymysql.connect(
+                **self.mysql_config,
+                connect_timeout=DB_TIMEOUT,
+                read_timeout=DB_TIMEOUT,
+                write_timeout=DB_TIMEOUT,
+            ) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute("SHOW VARIABLES LIKE 'read_only'")
+                    row = cursor.fetchone()
+            self.health.update(row is not None and row[1] == "OFF")
+        except (pymysql.MySQLError, OSError) as exc:
+            self.health.update(False)
+            logging.warning("MySQL health check failed (%s)", type(exc).__name__)
+
+    def run(self):
+        while not self.stop.is_set():
+            self.poll()
+            self.stop.wait(POLL_INTERVAL)
+
 
 class HttpHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200 if self.server.health.is_healthy() else 503)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
-  def do_GET(self):
-        global CACHE
-        if CACHE == "OK":
-          self.send_response(200)
-#          self.send_header('Content-type','text/html')
-#          self.end_headers()
-#          self.wfile.write(CACHE)
-          return
-        else:
-          self.send_response(500)
-#          self.send_header('Content-type','text/html')
-#          self.end_headers()
-#          self.wfile.write(CACHE)
-          return
+    def log_message(self, format, *args):
+        logging.debug("%s %s", self.client_address[0], format % args)
 
 
-class HttpFront(threading.Thread):
+class HealthServer(ThreadingHTTPServer):
+    def __init__(self, address, health):
+        self.health = health
+        self._slots = threading.BoundedSemaphore(MAX_REQUESTS)
+        super().__init__(address, HttpHandler)
 
- def __init__(self, httpconf):
-  self.http_port = httpconf["port"][0]
-  super(HttpFront, self).__init__()
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    @staticmethod
+    def interrupt_request(request):
+        try:
+            request.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def process_request_thread(self, request, client_address):
+        deadline = threading.Timer(REQUEST_DEADLINE, self.interrupt_request, args=(request,))
+        try:
+            deadline.start()
+            super().process_request_thread(request, client_address)
+        finally:
+            deadline.cancel()
+            self._slots.release()
 
 
- def run(self):
-   server = HTTPServer(('', int(self.http_port)), HttpHandler)
-   logging.warning("HTTP frontend create on port %s" % self.http_port )
-   server.serve_forever()
+def read_config(path):
+    config = configparser.ConfigParser(interpolation=None)
+    with open(path, encoding="utf-8") as source:
+        config.read_file(source)
+    http = config["http"]
+    port = http.getint("port")
+    if not 1 <= port <= 65535:
+        raise ValueError("[http] port must be between 1 and 65535")
+    mysql = config["mysql"]
+    return (http.get("bind_address", "127.0.0.1"), port), {
+        "host": mysql["mysql_host"],
+        "user": mysql["mysql_user"],
+        "password": mysql["mysql_password"],
+        "database": mysql["mysql_database"] or None,
+        "unix_socket": mysql.get("mysql_socket") or None,
+    }
 
-
-def configreader(config, section):
-  cnf = ConfigParser.RawConfigParser()
-  cnf.read(config)
-  configItems = cnf.items(section)
-  configuration = {}
-  for key, value in configItems:
-    configuration.setdefault(key, []).append(value)
-  return configuration
-
-class BackendChecker(object):
-
-  def __init__(self,daemonconf,configfile):
-    self.configfile = configfile
-    self.logfile_path = daemonconf['logfile_path'][0]
-    self.pidfile_path = daemonconf['pidfile_path'][0]
-    self.stdin_path = '/dev/null'
-    self.stdout_path = self.logfile_path
-    self.stderr_path = self.logfile_path
-    self.pidfile_timeout = 5
-
-  def run(self):
-    mysqlconf = configreader(self.configfile, 'mysql')
-    httpconf  = configreader(self.configfile, 'http')
-    logging.basicConfig(filename=self.logfile_path, level=logging.DEBUG, format='%(asctime)s %(message)s')
-    logging.debug('start')
-    dbcheck = DBCheck(mysqlconf)
-    httpfront = HttpFront(httpconf)
-    dbcheck.start()
-    httpfront.start()
-    while True:
-      time.sleep(1.0)
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    path = os.getenv("BACKEND_CHECKERCFG", "/usr/local/bin/backend_monitor.cfg")
+    health = Health()
+    stop = threading.Event()
+    try:
+        address, mysql_config = read_config(path)
+        server = HealthServer(address, health)
+    except configparser.Error as exc:
+        logging.error("Invalid configuration in %s (%s)", path, type(exc).__name__)
+        return 1
+    except (OSError, ValueError, KeyError) as exc:
+        logging.error("Cannot start backend monitor: %s", exc)
+        return 1
 
-	CACHE="NOT OK"
-	configfile = os.getenv('BACKEND_CHECKERCFG', '/usr/local/bin/backend_monitor.cfg')
-	daemonconf = configreader(configfile, 'daemon')
-	backendchecker = BackendChecker(daemonconf,configfile)
-	backendchecker_runner = runner.DaemonRunner(backendchecker)
-	backendchecker_runner.do_action()
+    with server:
+        DBCheck(mysql_config, health, stop).start()
+        logging.info("Health endpoint listening on %s:%s", *server.server_address)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            stop.set()
+    return 0
 
 
-if __name__ == '__main__':
-  main()
+if __name__ == "__main__":
+    raise SystemExit(main())
